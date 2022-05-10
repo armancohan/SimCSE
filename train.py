@@ -170,6 +170,7 @@ class OurTrainingArguments(TrainingArguments):
     ## both STS and transfer tasks (dev) at the end of training. Using --eval_transfer will allow evaluating
     ## both STS and transfer tasks (dev) during training.
     eval_transfer: bool = field(default=False, metadata={"help": "Evaluate transfer task dev sets (in validation)."})
+    # disable_tqdm: bool = field(default=False, metadata={"help": "Disable tqdm progress bar."})
 
     @cached_property
     @torch_required

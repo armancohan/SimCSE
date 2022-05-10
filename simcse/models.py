@@ -1,4 +1,6 @@
 from collections import namedtuple
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -8,6 +10,7 @@ import transformers
 from transformers import RobertaTokenizer
 from transformers.activations import gelu
 from transformers.file_utils import (
+    ModelOutput,
     add_code_sample_docstrings,
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
@@ -32,6 +35,28 @@ from transformers.models.t5.modeling_t5 import (
     T5Model,
     T5PreTrainedModel,
 )
+
+
+@dataclass
+class ThisModelOutput(ModelOutput):
+    """
+    Base class for outputs of question answering models.
+
+    """
+
+    last_hidden_state: Optional[torch.FloatTensor] = None
+    hidden_states: Optional[torch.FloatTensor] = None
+    pooler_output: Optional[torch.FloatTensor] = None
+    attentions: Optional[torch.FloatTensor] = None
+
+
+class ThisClassificationOutput(ModelOutput):
+
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    accuracy: Optional[torch.FloatTensor] = None
 
 
 class MLPLayer(nn.Module):
@@ -190,16 +215,17 @@ def cl_forward(
         assert model_type == "t5", "model_type must be bert or t5"
         assert mlm_input_ids is None, "mlm_input_ids must be None when using t5"
         assert cls.pooler_type == "cls", "pooler_type must be cls when using t5"
-
         model_outputs = encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
             decoder_input_ids=decoder_input_ids,
             output_hidden_states=True,
         )
-
-        outputs = namedtuple("Outputs", ["last_hidden_state", "hidden_states", "pooler_output", "attentions"])(
-            model_outputs.decoder_hidden_states[-1], None, None, None
+        outputs = ThisModelOutput(
+            last_hidden_state=model_outputs.decoder_hidden_states[-1],
+            hidden_states=None,
+            pooler_output=None,
+            attentions=None,
         )
     # Pooling
 
@@ -279,14 +305,12 @@ def cl_forward(
     if not return_dict:
         output = (cos_sim,) + outputs[2:]
         return ((loss,) + output) if loss is not None else output
-    return (
-        SequenceClassifierOutput(
-            loss=loss,
-            logits=cos_sim,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        ),
-        accuracy,
+    return ThisClassificationOutput(
+        loss=loss,
+        logits=cos_sim,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
+        accuracy=accuracy,
     )
 
 
@@ -321,36 +345,33 @@ def sentemb_forward(
             output_hidden_states=True if cls.pooler_type in ["avg_top2", "avg_first_last"] else False,
             return_dict=True,
         )
-
-        pooler_output = cls.pooler(attention_mask, outputs)
-        if cls.pooler_type == "cls" and not cls.model_args.mlp_only_train:
-            pooler_output = cls.mlp(pooler_output)
-
-        if not return_dict:
-            return (outputs[0], pooler_output) + outputs[2:]
-
-        return (
-            BaseModelOutputWithPoolingAndCrossAttentions(
-                pooler_output=pooler_output,
-                last_hidden_state=outputs.last_hidden_state,
-                hidden_states=outputs.hidden_states,
-            ),
-            _,
-        )
     elif model_type == "t5":
 
-        outputs = encoder(
+        assert cls.pooler_type == "cls", "pooler_type must be cls when using t5"
+
+        model_outputs = encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
             decoder_input_ids=decoder_input_ids,
             output_hidden_states=True,
         )
-        pooler_output = outputs[:, 0, :]
-        assert not return_dict
-        import ipdb
+        outputs = ThisModelOutput(
+            last_hidden_state=model_outputs.decoder_hidden_states[-1],
+            hidden_states=None,
+            pooler_output=None,
+            attentions=None,
+        )
 
-        ipdb.set_trace()
+    pooler_output = cls.pooler(attention_mask, outputs)
+    if cls.pooler_type == "cls" and not cls.model_args.mlp_only_train:
+        pooler_output = cls.mlp(pooler_output)
+
+    if not return_dict:
         return (outputs[0], pooler_output) + outputs[2:]
+
+    return BaseModelOutputWithPoolingAndCrossAttentions(
+        pooler_output=pooler_output, last_hidden_state=outputs.last_hidden_state, hidden_states=outputs.hidden_states
+    )
 
 
 class BertForCL(BertPreTrainedModel):
@@ -512,7 +533,6 @@ class T5ForCL(T5ForConditionalGeneration):
 
         device = input_ids.device
         dtype = input_ids.dtype
-
         pad_decoder_tokens = torch.full(
             size=(input_ids.shape[0], input_ids.shape[1]),
             fill_value=self.pad_token_id,

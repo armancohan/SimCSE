@@ -1,20 +1,49 @@
 import collections
+import importlib.util
 import inspect
-import math
-import sys
-import os
-import re
 import json
+import math
+import os
+import pathlib
+import re
 import shutil
+import sys
 import time
 import warnings
 from pathlib import Path
-import importlib.util
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+
+import torch
+import torch.nn as nn
 from packaging import version
+from torch.utils.data.dataloader import DataLoader
+from torch.utils.data.dataset import Dataset
+from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data.sampler import RandomSampler, SequentialSampler
 from transformers import Trainer
+from transformers.data.data_collator import (
+    DataCollator,
+    DataCollatorWithPadding,
+    default_data_collator,
+)
+from transformers.file_utils import (
+    WEIGHTS_NAME,
+    is_apex_available,
+    is_datasets_available,
+    is_in_notebook,
+    is_torch_tpu_available,
+)
 from transformers.modeling_utils import PreTrainedModel
-from transformers.training_args import ParallelMode, TrainingArguments
-from transformers.utils import logging
+from transformers.trainer_callback import (
+    CallbackHandler,
+    DefaultFlowCallback,
+    PrinterCallback,
+    ProgressCallback,
+    TrainerCallback,
+    TrainerControl,
+    TrainerState,
+)
+from transformers.trainer_pt_utils import reissue_pt_warnings
 from transformers.trainer_utils import (
     PREFIX_CHECKPOINT_DIR,
     BestRun,
@@ -27,35 +56,8 @@ from transformers.trainer_utils import (
     set_seed,
     speed_metrics,
 )
-from transformers.file_utils import (
-    WEIGHTS_NAME,
-    is_apex_available,
-    is_datasets_available,
-    is_in_notebook,
-    is_torch_tpu_available,
-)
-from transformers.trainer_callback import (
-    CallbackHandler,
-    DefaultFlowCallback,
-    PrinterCallback,
-    ProgressCallback,
-    TrainerCallback,
-    TrainerControl,
-    TrainerState,
-)
-from transformers.trainer_pt_utils import (
-    reissue_pt_warnings,
-)
-
+from transformers.training_args import ParallelMode, TrainingArguments
 from transformers.utils import logging
-from transformers.data.data_collator import DataCollator, DataCollatorWithPadding, default_data_collator
-import torch
-import torch.nn as nn
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
-from torch.utils.data.dataloader import DataLoader
-from torch.utils.data.dataset import Dataset
-from torch.utils.data.distributed import DistributedSampler
-from torch.utils.data.sampler import RandomSampler, SequentialSampler
 
 if is_torch_tpu_available():
     import torch_xla.core.xla_model as xm
@@ -72,9 +74,12 @@ if version.parse(torch.__version__) >= version.parse("1.6"):
 if is_datasets_available():
     import datasets
 
-from transformers.trainer import _model_unwrap
-from transformers.optimization import Adafactor, AdamW, get_scheduler
 import copy
+
+# tensorboard logging
+from torch.utils.tensorboard.writer import SummaryWriter
+from transformers.optimization import Adafactor, AdamW, get_scheduler
+from transformers.trainer import _model_unwrap
 
 # Set path to SentEval
 PATH_TO_SENTEVAL = "./SentEval"
@@ -82,15 +87,28 @@ PATH_TO_DATA = "./SentEval/data"
 
 # Import SentEval
 sys.path.insert(0, PATH_TO_SENTEVAL)
-import senteval
-import numpy as np
 from datetime import datetime
+
+import numpy as np
+import senteval
 from filelock import FileLock
 
 logger = logging.get_logger(__name__)
 
 
 class CLTrainer(Trainer):
+    def __init__(self, *args, **kwargs):
+
+        i = 0
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            logdir = f"runs/self.args.output_dir/logs/version_{i}"
+            pathlib.Path(logdir).parent.mkdir(parents=True, exist_ok=True)
+            while os.path.exists(logdir):
+                i += 1
+                logdir = f"runs/self.args.output_dir/logs/version_{i}"
+            self.tb_writer = SummaryWriter(log_dir=logdir)
+        super().__init__(*args, **kwargs)
+
     def evaluate(
         self,
         eval_dataset: Optional[Dataset] = None,
@@ -145,6 +163,8 @@ class CLTrainer(Trainer):
             metrics["eval_avg_transfer"] = avg_transfer
 
         self.log(metrics)
+        if torch.distributed.get_rank() == 0:
+            self.tb_writer.add_scalars("eval", metrics, self.state.global_step)
         return metrics
 
     def _save_checkpoint(self, model, trial, metrics=None):
@@ -504,8 +524,12 @@ class CLTrainer(Trainer):
                     self.state.global_step += 1
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(self.args, self.state, self.control)
-
                     self._maybe_log_save_evaluate(tr_loss, model, trial, epoch)
+                    if torch.distributed.get_rank() == 0:
+                        self.tb_writer.add_scalar("lr", self.lr_scheduler.get_lr()[0], self.state.global_step)
+                        self.tb_writer.add_scalar(
+                            "loss", tr_loss / self.args.gradient_accumulation_steps, self.state.global_step
+                        )
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
@@ -533,7 +557,15 @@ class CLTrainer(Trainer):
         if self.args.load_best_model_at_end and self.state.best_model_checkpoint is not None:
             logger.info(f"Loading best model from {self.state.best_model_checkpoint} (score: {self.state.best_metric}).")
             if isinstance(self.model, PreTrainedModel):
-                self.model = self.model.from_pretrained(self.state.best_model_checkpoint, model_args=self.model_args)
+                if "t5" in self.args.model_name_or_path:
+                    self.model = self.model.from_pretrained(
+                        self.state.best_model_checkpoint,
+                        model_args=self.model_args,
+                        cls_token_id=self.tokenizer.cls_token_id,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                    )
+                else:
+                    self.model = self.model.from_pretrained(self.state.best_model_checkpoint, model_args=self.model_args)
                 if not self.is_model_parallel:
                     self.model = self.model.to(self.args.device)
             else:
