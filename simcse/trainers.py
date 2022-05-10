@@ -75,9 +75,10 @@ if is_datasets_available():
 from transformers.trainer import _model_unwrap
 from transformers.optimization import Adafactor, AdamW, get_scheduler
 import copy
+
 # Set path to SentEval
-PATH_TO_SENTEVAL = './SentEval'
-PATH_TO_DATA = './SentEval/data'
+PATH_TO_SENTEVAL = "./SentEval"
+PATH_TO_DATA = "./SentEval/data"
 
 # Import SentEval
 sys.path.insert(0, PATH_TO_SENTEVAL)
@@ -88,8 +89,8 @@ from filelock import FileLock
 
 logger = logging.get_logger(__name__)
 
-class CLTrainer(Trainer):
 
+class CLTrainer(Trainer):
     def evaluate(
         self,
         eval_dataset: Optional[Dataset] = None,
@@ -103,10 +104,10 @@ class CLTrainer(Trainer):
             return
 
         def batcher(params, batch):
-            sentences = [' '.join(s) for s in batch]
+            sentences = [" ".join(s) for s in batch]
             batch = self.tokenizer.batch_encode_plus(
                 sentences,
-                return_tensors='pt',
+                return_tensors="pt",
                 padding=True,
             )
             for k in batch:
@@ -117,32 +118,35 @@ class CLTrainer(Trainer):
             return pooler_output.cpu()
 
         # Set params for SentEval (fastmode)
-        params = {'task_path': PATH_TO_DATA, 'usepytorch': True, 'kfold': 5}
-        params['classifier'] = {'nhid': 0, 'optim': 'rmsprop', 'batch_size': 128,
-                                            'tenacity': 3, 'epoch_size': 2}
+        params = {"task_path": PATH_TO_DATA, "usepytorch": True, "kfold": 5}
+        params["classifier"] = {"nhid": 0, "optim": "rmsprop", "batch_size": 128, "tenacity": 3, "epoch_size": 2}
 
         se = senteval.engine.SE(params, batcher, prepare)
-        tasks = ['STSBenchmark', 'SICKRelatedness']
+        tasks = ["STSBenchmark", "SICKRelatedness"]
         if eval_senteval_transfer or self.args.eval_transfer:
-            tasks = ['STSBenchmark', 'SICKRelatedness', 'MR', 'CR', 'SUBJ', 'MPQA', 'SST2', 'TREC', 'MRPC']
+            tasks = ["STSBenchmark", "SICKRelatedness", "MR", "CR", "SUBJ", "MPQA", "SST2", "TREC", "MRPC"]
         self.model.eval()
         results = se.eval(tasks)
-        
-        stsb_spearman = results['STSBenchmark']['dev']['spearman'][0]
-        sickr_spearman = results['SICKRelatedness']['dev']['spearman'][0]
 
-        metrics = {"eval_stsb_spearman": stsb_spearman, "eval_sickr_spearman": sickr_spearman, "eval_avg_sts": (stsb_spearman + sickr_spearman) / 2} 
+        stsb_spearman = results["STSBenchmark"]["dev"]["spearman"][0]
+        sickr_spearman = results["SICKRelatedness"]["dev"]["spearman"][0]
+
+        metrics = {
+            "eval_stsb_spearman": stsb_spearman,
+            "eval_sickr_spearman": sickr_spearman,
+            "eval_avg_sts": (stsb_spearman + sickr_spearman) / 2,
+        }
         if eval_senteval_transfer or self.args.eval_transfer:
             avg_transfer = 0
-            for task in ['MR', 'CR', 'SUBJ', 'MPQA', 'SST2', 'TREC', 'MRPC']:
-                avg_transfer += results[task]['devacc']
-                metrics['eval_{}'.format(task)] = results[task]['devacc']
+            for task in ["MR", "CR", "SUBJ", "MPQA", "SST2", "TREC", "MRPC"]:
+                avg_transfer += results[task]["devacc"]
+                metrics["eval_{}".format(task)] = results[task]["devacc"]
             avg_transfer /= 7
-            metrics['eval_avg_transfer'] = avg_transfer
+            metrics["eval_avg_transfer"] = avg_transfer
 
         self.log(metrics)
         return metrics
-        
+
     def _save_checkpoint(self, model, trial, metrics=None):
         """
         Compared to original implementation, we change the saving policy to
@@ -234,7 +238,6 @@ class CLTrainer(Trainer):
                     torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
                 reissue_pt_warnings(caught_warnings)
 
-
             # Save the Trainer state
             if self.is_world_process_zero():
                 self.state.save_to_json(os.path.join(output_dir, "trainer_state.json"))
@@ -242,7 +245,7 @@ class CLTrainer(Trainer):
             # Maybe delete some older checkpoints.
             if self.is_world_process_zero():
                 self._rotate_checkpoints(use_mtime=True)
-    
+
     def train(self, model_path: Optional[str] = None, trial: Union["optuna.Trial", Dict[str, Any]] = None):
         """
         Main training entry point.
@@ -253,8 +256,8 @@ class CLTrainer(Trainer):
                 training will resume from the optimizer/scheduler states loaded here.
             trial (:obj:`optuna.Trial` or :obj:`Dict[str, Any]`, `optional`):
                 The trial run or the hyperparameter dictionary for hyperparameter search.
-        
-        The main difference between ours and Huggingface's original implementation is that we 
+
+        The main difference between ours and Huggingface's original implementation is that we
         also load model_args when reloading best checkpoints for evaluation.
         """
         # This might change the seed so needs to run first.
@@ -277,7 +280,7 @@ class CLTrainer(Trainer):
 
         # Keeping track whether we can can len() on the dataset or not
         train_dataset_is_sized = isinstance(self.train_dataset, collections.abc.Sized)
-        
+
         # Data loader and number of training steps
         train_dataloader = self.get_train_dataloader()
 
@@ -364,9 +367,7 @@ class CLTrainer(Trainer):
             )
 
         num_examples = (
-            self.num_examples(train_dataloader)
-            if train_dataset_is_sized
-            else total_train_batch_size * self.args.max_steps
+            self.num_examples(train_dataloader) if train_dataset_is_sized else total_train_batch_size * self.args.max_steps
         )
 
         logger.info("***** Running training *****")
@@ -495,7 +496,7 @@ class CLTrainer(Trainer):
                         self.scaler.update()
                     else:
                         self.optimizer.step()
-                    
+
                     self.lr_scheduler.step()
 
                     model.zero_grad()
@@ -530,9 +531,7 @@ class CLTrainer(Trainer):
 
         logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
         if self.args.load_best_model_at_end and self.state.best_model_checkpoint is not None:
-            logger.info(
-                f"Loading best model from {self.state.best_model_checkpoint} (score: {self.state.best_metric})."
-            )
+            logger.info(f"Loading best model from {self.state.best_model_checkpoint} (score: {self.state.best_metric}).")
             if isinstance(self.model, PreTrainedModel):
                 self.model = self.model.from_pretrained(self.state.best_model_checkpoint, model_args=self.model_args)
                 if not self.is_model_parallel:
