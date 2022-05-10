@@ -1,16 +1,15 @@
+import collections
 import logging
 import math
 import os
+import random
 import sys
 from dataclasses import dataclass, field
-from typing import Optional, Union, List, Dict, Tuple
+from typing import Dict, List, Optional, Tuple, Union
+
 import torch
-import collections
-import random
-
-from datasets import load_dataset
-
 import transformers
+from datasets import load_dataset
 from transformers import (
     CONFIG_MAPPING,
     MODEL_FOR_MASKED_LM_MAPPING,
@@ -18,28 +17,39 @@ from transformers import (
     AutoModelForMaskedLM,
     AutoModelForSequenceClassification,
     AutoTokenizer,
+    BertForPreTraining,
+    BertModel,
     DataCollatorForLanguageModeling,
     DataCollatorWithPadding,
+    EvalPrediction,
     HfArgumentParser,
+    RobertaModel,
     Trainer,
     TrainingArguments,
     default_data_collator,
     set_seed,
-    EvalPrediction,
-    BertModel,
-    BertForPreTraining,
-    RobertaModel
 )
-from transformers.tokenization_utils_base import BatchEncoding, PaddingStrategy, PreTrainedTokenizerBase
-from transformers.trainer_utils import is_main_process
 from transformers.data.data_collator import DataCollatorForLanguageModeling
-from transformers.file_utils import cached_property, torch_required, is_torch_available, is_torch_tpu_available
-from simcse.models import RobertaForCL, BertForCL
+from transformers.file_utils import (
+    cached_property,
+    is_torch_available,
+    is_torch_tpu_available,
+    torch_required,
+)
+from transformers.tokenization_utils_base import (
+    BatchEncoding,
+    PaddingStrategy,
+    PreTrainedTokenizerBase,
+)
+from transformers.trainer_utils import is_main_process
+
+from simcse.models import BertForCL, RobertaForCL, T5ForCL
 from simcse.trainers import CLTrainer
 
 logger = logging.getLogger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+
 
 @dataclass
 class ModelArguments:
@@ -51,8 +61,7 @@ class ModelArguments:
     model_name_or_path: Optional[str] = field(
         default=None,
         metadata={
-            "help": "The model checkpoint for weights initialization."
-            "Don't set if you want to train a model from scratch."
+            "help": "The model checkpoint for weights initialization." "Don't set if you want to train a model from scratch."
         },
     )
     model_type: Optional[str] = field(
@@ -86,42 +95,20 @@ class ModelArguments:
     )
 
     # SimCSE's arguments
-    temp: float = field(
-        default=0.05,
-        metadata={
-            "help": "Temperature for softmax."
-        }
-    )
+    temp: float = field(default=0.05, metadata={"help": "Temperature for softmax."})
     pooler_type: str = field(
         default="cls",
-        metadata={
-            "help": "What kind of pooler to use (cls, cls_before_pooler, avg, avg_top2, avg_first_last)."
-        }
-    ) 
+        metadata={"help": "What kind of pooler to use (cls, cls_before_pooler, avg, avg_top2, avg_first_last)."},
+    )
     hard_negative_weight: float = field(
         default=0,
-        metadata={
-            "help": "The **logit** of weight for hard negatives (only effective if hard negatives are used)."
-        }
+        metadata={"help": "The **logit** of weight for hard negatives (only effective if hard negatives are used)."},
     )
-    do_mlm: bool = field(
-        default=False,
-        metadata={
-            "help": "Whether to use MLM auxiliary objective."
-        }
-    )
+    do_mlm: bool = field(default=False, metadata={"help": "Whether to use MLM auxiliary objective."})
     mlm_weight: float = field(
-        default=0.1,
-        metadata={
-            "help": "Weight for MLM auxiliary objective (only effective if --do_mlm)."
-        }
+        default=0.1, metadata={"help": "Weight for MLM auxiliary objective (only effective if --do_mlm)."}
     )
-    mlp_only_train: bool = field(
-        default=False,
-        metadata={
-            "help": "Use MLP only during training"
-        }
-    )
+    mlp_only_train: bool = field(default=False, metadata={"help": "Use MLP only during training"})
 
 
 @dataclass
@@ -130,21 +117,17 @@ class DataTrainingArguments:
     Arguments pertaining to what data we are going to input our model for training and eval.
     """
 
-    # Huggingface's original arguments. 
+    # Huggingface's original arguments.
     dataset_name: Optional[str] = field(
         default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
     )
     dataset_config_name: Optional[str] = field(
         default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
     )
-    overwrite_cache: bool = field(
-        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
-    )
+    overwrite_cache: bool = field(default=False, metadata={"help": "Overwrite the cached training and evaluation sets"})
     validation_split_percentage: Optional[int] = field(
         default=5,
-        metadata={
-            "help": "The percentage of the train set used as validation set in case there's no validation split"
-        },
+        metadata={"help": "The percentage of the train set used as validation set in case there's no validation split"},
     )
     preprocessing_num_workers: Optional[int] = field(
         default=None,
@@ -152,10 +135,7 @@ class DataTrainingArguments:
     )
 
     # SimCSE's arguments
-    train_file: Optional[str] = field(
-        default=None, 
-        metadata={"help": "The training data file (.txt or .csv)."}
-    )
+    train_file: Optional[str] = field(default=None, metadata={"help": "The training data file (.txt or .csv)."})
     max_seq_length: Optional[int] = field(
         default=32,
         metadata={
@@ -171,8 +151,7 @@ class DataTrainingArguments:
         },
     )
     mlm_probability: float = field(
-        default=0.15, 
-        metadata={"help": "Ratio of tokens to mask for MLM (only effective if --do_mlm)"}
+        default=0.15, metadata={"help": "Ratio of tokens to mask for MLM (only effective if --do_mlm)"}
     )
 
     def __post_init__(self):
@@ -187,13 +166,10 @@ class DataTrainingArguments:
 @dataclass
 class OurTrainingArguments(TrainingArguments):
     # Evaluation
-    ## By default, we evaluate STS (dev) during training (for selecting best checkpoints) and evaluate 
+    ## By default, we evaluate STS (dev) during training (for selecting best checkpoints) and evaluate
     ## both STS and transfer tasks (dev) at the end of training. Using --eval_transfer will allow evaluating
     ## both STS and transfer tasks (dev) during training.
-    eval_transfer: bool = field(
-        default=False,
-        metadata={"help": "Evaluate transfer task dev sets (in validation)."}
-    )
+    eval_transfer: bool = field(default=False, metadata={"help": "Evaluate transfer task dev sets (in validation)."})
 
     @cached_property
     @torch_required
@@ -305,7 +281,9 @@ def main():
     if extension == "txt":
         extension = "text"
     if extension == "csv":
-        datasets = load_dataset(extension, data_files=data_files, cache_dir="./data/", delimiter="\t" if "tsv" in data_args.train_file else ",")
+        datasets = load_dataset(
+            extension, data_files=data_files, cache_dir="./data/", delimiter="\t" if "tsv" in data_args.train_file else ","
+        )
     else:
         datasets = load_dataset(extension, data_files=data_files, cache_dir="./data/")
 
@@ -346,30 +324,28 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
+    kwargs = {
+        "pretrained_model_name_or_path": model_args.model_name_or_path,
+        "from_tf": bool(".ckpt" in model_args.model_name_or_path),
+        "config": config,
+        "cache_dir": model_args.cache_dir,
+        "revision": model_args.model_revision,
+        "use_auth_token": True if model_args.use_auth_token else None,
+        "model_args": model_args,
+    }
     if model_args.model_name_or_path:
-        if 'roberta' in model_args.model_name_or_path:
-            model = RobertaForCL.from_pretrained(
-                model_args.model_name_or_path,
-                from_tf=bool(".ckpt" in model_args.model_name_or_path),
-                config=config,
-                cache_dir=model_args.cache_dir,
-                revision=model_args.model_revision,
-                use_auth_token=True if model_args.use_auth_token else None,
-                model_args=model_args                  
-            )
-        elif 'bert' in model_args.model_name_or_path:
-            model = BertForCL.from_pretrained(
-                model_args.model_name_or_path,
-                from_tf=bool(".ckpt" in model_args.model_name_or_path),
-                config=config,
-                cache_dir=model_args.cache_dir,
-                revision=model_args.model_revision,
-                use_auth_token=True if model_args.use_auth_token else None,
-                model_args=model_args
-            )
+        if "roberta" in model_args.model_name_or_path:
+            model = RobertaForCL.from_pretrained(**kwargs)
+        elif "bert" in model_args.model_name_or_path:
+            model = BertForCL.from_pretrained(**kwargs)
             if model_args.do_mlm:
                 pretrained_model = BertForPreTraining.from_pretrained(model_args.model_name_or_path)
                 model.lm_head.load_state_dict(pretrained_model.cls.predictions.state_dict())
+        elif "t5" in model_args.model_name_or_path:
+            assert "t5" in model_args.tokenizer_name
+            model = T5ForCL.from_pretrained(
+                **kwargs, cls_token_id=tokenizer.cls_token_id, pad_token_id=tokenizer.pad_token_id
+            )
         else:
             raise NotImplementedError
     else:
@@ -377,7 +353,8 @@ def main():
         logger.info("Training new model from scratch")
         model = AutoModelForMaskedLM.from_config(config)
 
-    model.resize_token_embeddings(len(tokenizer))
+    if "t5" not in model_args.model_name_or_path:
+        model.resize_token_embeddings(len(tokenizer))
 
     # Prepare features
     column_names = datasets["train"].column_names
@@ -401,20 +378,20 @@ def main():
     def prepare_features(examples):
         # padding = longest (default)
         #   If no sentence in the batch exceed the max length, then use
-        #   the max sentence length in the batch, otherwise use the 
+        #   the max sentence length in the batch, otherwise use the
         #   max sentence length in the argument and truncate those that
         #   exceed the max length.
         # padding = max_length (when pad_to_max_length, for pressure test)
         #   All sentences are padded/truncated to data_args.max_seq_length.
         total = len(examples[sent0_cname])
 
-        # Avoid "None" fields 
+        # Avoid "None" fields
         for idx in range(total):
             if examples[sent0_cname][idx] is None:
                 examples[sent0_cname][idx] = " "
             if examples[sent1_cname][idx] is None:
                 examples[sent1_cname][idx] = " "
-        
+
         sentences = examples[sent0_cname] + examples[sent1_cname]
 
         # If hard negative exists
@@ -434,11 +411,14 @@ def main():
         features = {}
         if sent2_cname is not None:
             for key in sent_features:
-                features[key] = [[sent_features[key][i], sent_features[key][i+total], sent_features[key][i+total*2]] for i in range(total)]
+                features[key] = [
+                    [sent_features[key][i], sent_features[key][i + total], sent_features[key][i + total * 2]]
+                    for i in range(total)
+                ]
         else:
             for key in sent_features:
-                features[key] = [[sent_features[key][i], sent_features[key][i+total]] for i in range(total)]
-            
+                features[key] = [[sent_features[key][i], sent_features[key][i + total]] for i in range(total)]
+
         return features
 
     if training_args.do_train:
@@ -461,11 +441,13 @@ def main():
         mlm: bool = True
         mlm_probability: float = data_args.mlm_probability
 
-        def __call__(self, features: List[Dict[str, Union[List[int], List[List[int]], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-            special_keys = ['input_ids', 'attention_mask', 'token_type_ids', 'mlm_input_ids', 'mlm_labels']
+        def __call__(
+            self, features: List[Dict[str, Union[List[int], List[List[int]], torch.Tensor]]]
+        ) -> Dict[str, torch.Tensor]:
+            special_keys = ["input_ids", "attention_mask", "token_type_ids", "mlm_input_ids", "mlm_labels"]
             bs = len(features)
             if bs > 0:
-                num_sent = len(features[0]['input_ids'])
+                num_sent = len(features[0]["input_ids"])
             else:
                 return
             flat_features = []
@@ -483,7 +465,10 @@ def main():
             if model_args.do_mlm:
                 batch["mlm_input_ids"], batch["mlm_labels"] = self.mask_tokens(batch["input_ids"])
 
-            batch = {k: batch[k].view(bs, num_sent, -1) if k in special_keys else batch[k].view(bs, num_sent, -1)[:, 0] for k in batch}
+            batch = {
+                k: batch[k].view(bs, num_sent, -1) if k in special_keys else batch[k].view(bs, num_sent, -1)[:, 0]
+                for k in batch
+            }
 
             if "label" in batch:
                 batch["labels"] = batch["label"]
@@ -493,7 +478,7 @@ def main():
                 del batch["label_ids"]
 
             return batch
-        
+
         def mask_tokens(
             self, inputs: torch.Tensor, special_tokens_mask: Optional[torch.Tensor] = None
         ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -575,6 +560,7 @@ def main():
                     writer.write(f"{key} = {value}\n")
 
     return results
+
 
 def _mp_fn(index):
     # For xla_spawn (TPUs)

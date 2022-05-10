@@ -1,12 +1,11 @@
+from collections import namedtuple
+
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
-
 import transformers
 from transformers import RobertaTokenizer
-from transformers.models.roberta.modeling_roberta import RobertaPreTrainedModel, RobertaModel, RobertaLMHead
-from transformers.models.bert.modeling_bert import BertPreTrainedModel, BertModel, BertLMPredictionHead
 from transformers.activations import gelu
 from transformers.file_utils import (
     add_code_sample_docstrings,
@@ -14,7 +13,26 @@ from transformers.file_utils import (
     add_start_docstrings_to_model_forward,
     replace_return_docstrings,
 )
-from transformers.modeling_outputs import SequenceClassifierOutput, BaseModelOutputWithPoolingAndCrossAttentions
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPoolingAndCrossAttentions,
+    SequenceClassifierOutput,
+)
+from transformers.models.bert.modeling_bert import (
+    BertLMPredictionHead,
+    BertModel,
+    BertPreTrainedModel,
+)
+from transformers.models.roberta.modeling_roberta import (
+    RobertaLMHead,
+    RobertaModel,
+    RobertaPreTrainedModel,
+)
+from transformers.models.t5.modeling_t5 import (
+    T5ForConditionalGeneration,
+    T5Model,
+    T5PreTrainedModel,
+)
+
 
 class MLPLayer(nn.Module):
     """
@@ -31,6 +49,7 @@ class MLPLayer(nn.Module):
         x = self.activation(x)
 
         return x
+
 
 class Similarity(nn.Module):
     """
@@ -55,29 +74,36 @@ class Pooler(nn.Module):
     'avg_top2': average of the last two layers.
     'avg_first_last': average of the first and the last layers.
     """
+
     def __init__(self, pooler_type):
         super().__init__()
         self.pooler_type = pooler_type
-        assert self.pooler_type in ["cls", "cls_before_pooler", "avg", "avg_top2", "avg_first_last"], "unrecognized pooling type %s" % self.pooler_type
+        assert self.pooler_type in ["cls", "cls_before_pooler", "avg", "avg_top2", "avg_first_last"], (
+            "unrecognized pooling type %s" % self.pooler_type
+        )
 
     def forward(self, attention_mask, outputs):
         last_hidden = outputs.last_hidden_state
         pooler_output = outputs.pooler_output
         hidden_states = outputs.hidden_states
 
-        if self.pooler_type in ['cls_before_pooler', 'cls']:
+        if self.pooler_type in ["cls_before_pooler", "cls"]:
             return last_hidden[:, 0]
         elif self.pooler_type == "avg":
-            return ((last_hidden * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(-1).unsqueeze(-1))
+            return (last_hidden * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(-1).unsqueeze(-1)
         elif self.pooler_type == "avg_first_last":
             first_hidden = hidden_states[0]
             last_hidden = hidden_states[-1]
-            pooled_result = ((first_hidden + last_hidden) / 2.0 * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(-1).unsqueeze(-1)
+            pooled_result = ((first_hidden + last_hidden) / 2.0 * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(
+                -1
+            ).unsqueeze(-1)
             return pooled_result
         elif self.pooler_type == "avg_top2":
             second_last_hidden = hidden_states[-2]
             last_hidden = hidden_states[-1]
-            pooled_result = ((last_hidden + second_last_hidden) / 2.0 * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(-1).unsqueeze(-1)
+            pooled_result = ((last_hidden + second_last_hidden) / 2.0 * attention_mask.unsqueeze(-1)).sum(
+                1
+            ) / attention_mask.sum(-1).unsqueeze(-1)
             return pooled_result
         else:
             raise NotImplementedError
@@ -94,7 +120,9 @@ def cl_init(cls, config):
     cls.sim = Similarity(temp=cls.model_args.temp)
     cls.init_weights()
 
-def cl_forward(cls,
+
+def cl_forward(
+    cls,
     encoder,
     input_ids=None,
     attention_mask=None,
@@ -108,6 +136,8 @@ def cl_forward(cls,
     return_dict=None,
     mlm_input_ids=None,
     mlm_labels=None,
+    model_type="bert",
+    decoder_input_ids=None,  # for t5
 ):
     return_dict = return_dict if return_dict is not None else cls.config.use_return_dict
     ori_input_ids = input_ids
@@ -118,42 +148,63 @@ def cl_forward(cls,
 
     mlm_outputs = None
     # Flatten input for encoding
-    input_ids = input_ids.view((-1, input_ids.size(-1))) # (bs * num_sent, len)
-    attention_mask = attention_mask.view((-1, attention_mask.size(-1))) # (bs * num_sent len)
+    input_ids = input_ids.view((-1, input_ids.size(-1)))  # (bs * num_sent, len)
+    attention_mask = attention_mask.view((-1, attention_mask.size(-1)))  # (bs * num_sent len)
     if token_type_ids is not None:
-        token_type_ids = token_type_ids.view((-1, token_type_ids.size(-1))) # (bs * num_sent, len)
+        token_type_ids = token_type_ids.view((-1, token_type_ids.size(-1)))  # (bs * num_sent, len)
 
-    # Get raw embeddings
-    outputs = encoder(
-        input_ids,
-        attention_mask=attention_mask,
-        token_type_ids=token_type_ids,
-        position_ids=position_ids,
-        head_mask=head_mask,
-        inputs_embeds=inputs_embeds,
-        output_attentions=output_attentions,
-        output_hidden_states=True if cls.model_args.pooler_type in ['avg_top2', 'avg_first_last'] else False,
-        return_dict=True,
-    )
+    if decoder_input_ids is not None:
+        decoder_input_ids = decoder_input_ids.view(-1, 1)  # (bs * num_sent, len)
 
-    # MLM auxiliary objective
-    if mlm_input_ids is not None:
-        mlm_input_ids = mlm_input_ids.view((-1, mlm_input_ids.size(-1)))
-        mlm_outputs = encoder(
-            mlm_input_ids,
+    if model_type == "bert":
+
+        # Get raw embeddings
+        outputs = encoder(
+            input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
-            output_hidden_states=True if cls.model_args.pooler_type in ['avg_top2', 'avg_first_last'] else False,
+            output_hidden_states=True if cls.model_args.pooler_type in ["avg_top2", "avg_first_last"] else False,
             return_dict=True,
         )
 
+        # MLM auxiliary objective
+        if mlm_input_ids is not None:
+            mlm_input_ids = mlm_input_ids.view((-1, mlm_input_ids.size(-1)))
+            mlm_outputs = encoder(
+                mlm_input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                head_mask=head_mask,
+                inputs_embeds=inputs_embeds,
+                output_attentions=output_attentions,
+                output_hidden_states=True if cls.model_args.pooler_type in ["avg_top2", "avg_first_last"] else False,
+                return_dict=True,
+            )
+
+    else:
+        assert model_type == "t5", "model_type must be bert or t5"
+        assert mlm_input_ids is None, "mlm_input_ids must be None when using t5"
+        assert cls.pooler_type == "cls", "pooler_type must be cls when using t5"
+
+        model_outputs = encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            decoder_input_ids=decoder_input_ids,
+            output_hidden_states=True,
+        )
+
+        outputs = namedtuple("Outputs", ["last_hidden_state", "hidden_states", "pooler_output", "attentions"])(
+            model_outputs.decoder_hidden_states[-1], None, None, None
+        )
     # Pooling
+
     pooler_output = cls.pooler(attention_mask, outputs)
-    pooler_output = pooler_output.view((batch_size, num_sent, pooler_output.size(-1))) # (bs, num_sent, hidden)
+    pooler_output = pooler_output.view((batch_size, num_sent, pooler_output.size(-1)))  # (bs, num_sent, hidden)
 
     # If using "cls", we add an extra MLP layer
     # (same as BERT's original implementation) over the representation.
@@ -161,7 +212,7 @@ def cl_forward(cls,
         pooler_output = cls.mlp(pooler_output)
 
     # Separate representation
-    z1, z2 = pooler_output[:,0], pooler_output[:,1]
+    z1, z2 = pooler_output[:, 0], pooler_output[:, 1]
 
     # Hard negative
     if num_sent == 3:
@@ -205,11 +256,18 @@ def cl_forward(cls,
         # Note that weights are actually logits of weights
         z3_weight = cls.model_args.hard_negative_weight
         weights = torch.tensor(
-            [[0.0] * (cos_sim.size(-1) - z1_z3_cos.size(-1)) + [0.0] * i + [z3_weight] + [0.0] * (z1_z3_cos.size(-1) - i - 1) for i in range(z1_z3_cos.size(-1))]
+            [
+                [0.0] * (cos_sim.size(-1) - z1_z3_cos.size(-1))
+                + [0.0] * i
+                + [z3_weight]
+                + [0.0] * (z1_z3_cos.size(-1) - i - 1)
+                for i in range(z1_z3_cos.size(-1))
+            ]
         ).to(cls.device)
         cos_sim = cos_sim + weights
 
     loss = loss_fct(cos_sim, labels)
+    accuracy = (cos_sim.argmax(dim=1) == labels).float().mean()
 
     # Calculate loss for MLM
     if mlm_outputs is not None and mlm_labels is not None:
@@ -221,11 +279,14 @@ def cl_forward(cls,
     if not return_dict:
         output = (cos_sim,) + outputs[2:]
         return ((loss,) + output) if loss is not None else output
-    return SequenceClassifierOutput(
-        loss=loss,
-        logits=cos_sim,
-        hidden_states=outputs.hidden_states,
-        attentions=outputs.attentions,
+    return (
+        SequenceClassifierOutput(
+            loss=loss,
+            logits=cos_sim,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        ),
+        accuracy,
     )
 
 
@@ -242,34 +303,54 @@ def sentemb_forward(
     output_attentions=None,
     output_hidden_states=None,
     return_dict=None,
+    decoder_input_ids=None,  # used for t5 only
+    model_type="bert",
 ):
 
     return_dict = return_dict if return_dict is not None else cls.config.use_return_dict
 
-    outputs = encoder(
-        input_ids,
-        attention_mask=attention_mask,
-        token_type_ids=token_type_ids,
-        position_ids=position_ids,
-        head_mask=head_mask,
-        inputs_embeds=inputs_embeds,
-        output_attentions=output_attentions,
-        output_hidden_states=True if cls.pooler_type in ['avg_top2', 'avg_first_last'] else False,
-        return_dict=True,
-    )
+    if model_type == "bert":
+        outputs = encoder(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=True if cls.pooler_type in ["avg_top2", "avg_first_last"] else False,
+            return_dict=True,
+        )
 
-    pooler_output = cls.pooler(attention_mask, outputs)
-    if cls.pooler_type == "cls" and not cls.model_args.mlp_only_train:
-        pooler_output = cls.mlp(pooler_output)
+        pooler_output = cls.pooler(attention_mask, outputs)
+        if cls.pooler_type == "cls" and not cls.model_args.mlp_only_train:
+            pooler_output = cls.mlp(pooler_output)
 
-    if not return_dict:
+        if not return_dict:
+            return (outputs[0], pooler_output) + outputs[2:]
+
+        return (
+            BaseModelOutputWithPoolingAndCrossAttentions(
+                pooler_output=pooler_output,
+                last_hidden_state=outputs.last_hidden_state,
+                hidden_states=outputs.hidden_states,
+            ),
+            _,
+        )
+    elif model_type == "t5":
+
+        outputs = encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            decoder_input_ids=decoder_input_ids,
+            output_hidden_states=True,
+        )
+        pooler_output = outputs[:, 0, :]
+        assert not return_dict
+        import ipdb
+
+        ipdb.set_trace()
         return (outputs[0], pooler_output) + outputs[2:]
-
-    return BaseModelOutputWithPoolingAndCrossAttentions(
-        pooler_output=pooler_output,
-        last_hidden_state=outputs.last_hidden_state,
-        hidden_states=outputs.hidden_states,
-    )
 
 
 class BertForCL(BertPreTrainedModel):
@@ -285,7 +366,8 @@ class BertForCL(BertPreTrainedModel):
 
         cl_init(self, config)
 
-    def forward(self,
+    def forward(
+        self,
         input_ids=None,
         attention_mask=None,
         token_type_ids=None,
@@ -301,7 +383,9 @@ class BertForCL(BertPreTrainedModel):
         mlm_labels=None,
     ):
         if sent_emb:
-            return sentemb_forward(self, self.bert,
+            return sentemb_forward(
+                self,
+                self.bert,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
@@ -314,7 +398,9 @@ class BertForCL(BertPreTrainedModel):
                 return_dict=return_dict,
             )
         else:
-            return cl_forward(self, self.bert,
+            return cl_forward(
+                self,
+                self.bert,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
@@ -328,7 +414,6 @@ class BertForCL(BertPreTrainedModel):
                 mlm_input_ids=mlm_input_ids,
                 mlm_labels=mlm_labels,
             )
-
 
 
 class RobertaForCL(RobertaPreTrainedModel):
@@ -344,7 +429,8 @@ class RobertaForCL(RobertaPreTrainedModel):
 
         cl_init(self, config)
 
-    def forward(self,
+    def forward(
+        self,
         input_ids=None,
         attention_mask=None,
         token_type_ids=None,
@@ -360,7 +446,9 @@ class RobertaForCL(RobertaPreTrainedModel):
         mlm_labels=None,
     ):
         if sent_emb:
-            return sentemb_forward(self, self.roberta,
+            return sentemb_forward(
+                self,
+                self.roberta,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
@@ -373,7 +461,9 @@ class RobertaForCL(RobertaPreTrainedModel):
                 return_dict=return_dict,
             )
         else:
-            return cl_forward(self, self.roberta,
+            return cl_forward(
+                self,
+                self.roberta,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
@@ -386,4 +476,78 @@ class RobertaForCL(RobertaPreTrainedModel):
                 return_dict=return_dict,
                 mlm_input_ids=mlm_input_ids,
                 mlm_labels=mlm_labels,
+            )
+
+
+class T5ForCL(T5ForConditionalGeneration):
+    _keys_to_ignore_on_load_missing = [r"position_ids"]
+
+    def __init__(self, config, cls_token_id, pad_token_id, *model_args, **model_kargs):
+        super().__init__(config)
+        self.model_args = model_kargs["model_args"]
+        self.cls_token_id = cls_token_id
+        self.pad_token_id = pad_token_id
+        cl_init(self, config)
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        decoder_input_ids=None,
+        decoder_attention_mask=None,
+        encoder_outputs=None,
+        past_key_values=None,
+        head_mask=None,
+        inputs_embeds=None,
+        decoder_inputs_embeds=None,
+        labels=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        sent_emb=False,
+        mlm_input_ids=None,
+        mlm_labels=None,
+    ):
+
+        device = input_ids.device
+        dtype = input_ids.dtype
+
+        pad_decoder_tokens = torch.full(
+            size=(input_ids.shape[0], input_ids.shape[1]),
+            fill_value=self.pad_token_id,
+            device=device,
+            dtype=dtype,
+        )
+        decoder_input_ids = pad_decoder_tokens
+
+        if sent_emb:
+            return sentemb_forward(
+                self,
+                super().forward,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                head_mask=head_mask,
+                inputs_embeds=inputs_embeds,
+                labels=labels,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                model_type="t5",
+                decoder_input_ids=decoder_input_ids,
+            )
+        else:
+            return cl_forward(
+                self,
+                super().forward,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                head_mask=head_mask,
+                inputs_embeds=inputs_embeds,
+                labels=labels,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                model_type="t5",
+                decoder_input_ids=decoder_input_ids,
             )
