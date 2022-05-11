@@ -526,7 +526,7 @@ class CLTrainer(Trainer):
                     self.control = self.callback_handler.on_step_end(self.args, self.state, self.control)
                     self._maybe_log_save_evaluate(tr_loss, model, trial, epoch)
                     if torch.distributed.get_rank() == 0:
-                        self.tb_writer.add_scalar("lr", self.lr_scheduler.get_lr()[0], self.state.global_step)
+                        self.tb_writer.add_scalar("lr", self.lr_scheduler.get_last_lr()[0], self.state.global_step)
                         self.tb_writer.add_scalar(
                             "loss", tr_loss / self.args.gradient_accumulation_steps, self.state.global_step
                         )
@@ -557,7 +557,7 @@ class CLTrainer(Trainer):
         if self.args.load_best_model_at_end and self.state.best_model_checkpoint is not None:
             logger.info(f"Loading best model from {self.state.best_model_checkpoint} (score: {self.state.best_metric}).")
             if isinstance(self.model, PreTrainedModel):
-                if "t5" in self.args.model_name_or_path:
+                if "t5" in self.model_args.args.model_name_or_path:
                     self.model = self.model.from_pretrained(
                         self.state.best_model_checkpoint,
                         model_args=self.model_args,
