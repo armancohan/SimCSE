@@ -43,7 +43,7 @@ from transformers.tokenization_utils_base import (
 )
 from transformers.trainer_utils import is_main_process
 
-from simcse.models import BertForCL, RobertaForCL
+from simcse.models import BertForCL, RobertaForCL, T5ForCL
 from simcse.trainers import CLTrainer
 
 logger = logging.getLogger(__name__)
@@ -170,6 +170,7 @@ class OurTrainingArguments(TrainingArguments):
     ## both STS and transfer tasks (dev) at the end of training. Using --eval_transfer will allow evaluating
     ## both STS and transfer tasks (dev) during training.
     eval_transfer: bool = field(default=False, metadata={"help": "Evaluate transfer task dev sets (in validation)."})
+    # disable_tqdm: bool = field(default=False, metadata={"help": "Disable tqdm progress bar."})
 
     @cached_property
     @torch_required
@@ -324,6 +325,15 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
+    kwargs = {
+        "pretrained_model_name_or_path": model_args.model_name_or_path,
+        "from_tf": bool(".ckpt" in model_args.model_name_or_path),
+        "config": config,
+        "cache_dir": model_args.cache_dir,
+        "revision": model_args.model_revision,
+        "use_auth_token": True if model_args.use_auth_token else None,
+        "model_args": model_args,
+    }
     if model_args.model_name_or_path:
         if "roberta" in model_args.model_name_or_path:
             model = RobertaForCL.from_pretrained(
@@ -348,6 +358,11 @@ def main():
             if model_args.do_mlm:
                 pretrained_model = BertForPreTraining.from_pretrained(model_args.model_name_or_path)
                 model.lm_head.load_state_dict(pretrained_model.cls.predictions.state_dict())
+        elif "t5" in model_args.model_name_or_path:
+            assert "t5" in model_args.tokenizer_name
+            model = T5ForCL.from_pretrained(
+                **kwargs, cls_token_id=tokenizer.cls_token_id, pad_token_id=tokenizer.pad_token_id
+            )
         else:
             raise NotImplementedError
     else:
@@ -355,7 +370,8 @@ def main():
         logger.info("Training new model from scratch")
         model = AutoModelForMaskedLM.from_config(config)
 
-    model.resize_token_embeddings(len(tokenizer))
+    if "t5" not in model_args.model_name_or_path:
+        model.resize_token_embeddings(len(tokenizer))
 
     # Prepare features
     column_names = datasets["train"].column_names
